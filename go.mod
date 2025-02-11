@@ -1,4 +1,4 @@
-module github.com/mheers/pulumi-helper
+module github.com/sdataplatform/pulumi-helper
 
 go 1.23.0
 

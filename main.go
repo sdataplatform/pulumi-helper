@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/mheers/pulumi-helper/cmd"
+	"github.com/sdataplatform/pulumi-helper/cmd"
 	"github.com/sirupsen/logrus"
 )
 

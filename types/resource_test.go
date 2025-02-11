@@ -4,9 +4,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mheers/pulumi-helper/mocks"
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/sdataplatform/pulumi-helper/mocks"
 	"github.com/stretchr/testify/require"
 )
 

@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"github.com/mheers/pulumi-helper/helpers"
-	"github.com/mheers/pulumi-helper/stack"
+	"github.com/sdataplatform/pulumi-helper/helpers"
+	"github.com/sdataplatform/pulumi-helper/stack"
 	"github.com/spf13/cobra"
 )
 

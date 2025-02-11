@@ -4,8 +4,8 @@ import (
 	"os"
 
 	"github.com/jedib0t/go-pretty/v6/table"
-	"github.com/mheers/pulumi-helper/helpers"
-	"github.com/mheers/pulumi-helper/workspace"
+	"github.com/sdataplatform/pulumi-helper/helpers"
+	"github.com/sdataplatform/pulumi-helper/workspace"
 	"github.com/spf13/cobra"
 )
 

@@ -3,10 +3,10 @@ package mocks
 import (
 	"encoding/json"
 
-	"github.com/mheers/pulumi-helper/mocks/provider"
 	pkgerrors "github.com/pkg/errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/sdataplatform/pulumi-helper/mocks/provider"
 )
 
 type Mocks int

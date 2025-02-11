@@ -8,7 +8,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/mheers/pulumi-helper/workspace"
+	"github.com/sdataplatform/pulumi-helper/workspace"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
