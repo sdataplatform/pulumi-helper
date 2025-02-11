@@ -17,12 +17,10 @@ func (Mocks) NewResource(args pulumi.MockResourceArgs) (string, resource.Propert
 
 func (Mocks) Call(args pulumi.MockCallArgs) (resource.PropertyMap, error) {
 	if args.Token == "kubernetes:helm:template" {
-		kp, err := provider.MakeKubeProvider(nil, "test", "v1.28", []byte{})
+		k8sProvider, err := provider.MakeKubeProvider(nil, "test", "v1.28", []byte{}, []byte{})
 		if err != nil {
 			return nil, err
 		}
-
-		k8sProvider := kp.(*provider.KubeProvider)
 
 		var jsonOpts string
 		if jsonOptsArgs := args.Args["jsonOpts"]; jsonOptsArgs.HasValue() && jsonOptsArgs.IsString() {

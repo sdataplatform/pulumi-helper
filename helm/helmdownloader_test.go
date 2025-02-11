@@ -17,12 +17,12 @@ func TestDownloadNifi(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestDownloadZookeeper(t *testing.T) {
+func TestDownloadCertManager(t *testing.T) {
 	src := HelmChartSrc{
 		HelmChartOpts: provider.HelmChartOpts{
-			Chart: "zookeeper",
+			Chart: "cert-manager",
 			HelmFetchOpts: provider.HelmFetchOpts{
-				Repo: "https://charts.bitnami.com/bitnami",
+				Repo: "https://charts.jetstack.io",
 			},
 		},
 	}

@@ -78,6 +78,7 @@ func decodeYaml(text, defaultNamespace string, clientSet *clients.DynamicClientS
 // For GVKs not in the table, look at the given objects for a matching CRD.
 // Finally, attempt to look up the GVK from the API server. If the GVK cannot be found, a
 // NoNamespaceInfoErr is returned.
+// --------Customized Method--------------No Client Set required----------------
 func IsNamespacedKind(gvk schema.GroupVersionKind, disco discovery.DiscoveryInterface, objs ...unstructured.Unstructured) (bool, error) {
 	if gvk.Group == "core" { // nolint:goconst
 		gvk.Group = ""

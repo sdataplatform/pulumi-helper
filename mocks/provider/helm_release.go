@@ -27,35 +27,35 @@ import (
 	"strings"
 	"time"
 
-	"dario.cat/mergo"
-	jsonpatch "github.com/evanphx/json-patch"
-	"github.com/golang/protobuf/ptypes/empty"
 	pbempty "github.com/golang/protobuf/ptypes/empty"
+	"github.com/imdario/mergo"
 	"github.com/mitchellh/mapstructure"
-	pkgerrors "github.com/pkg/errors"
 	"github.com/pulumi/pulumi-kubernetes/provider/v4/pkg/clients"
-	"github.com/pulumi/pulumi/pkg/v3/resource/provider"
+	"github.com/pulumi/pulumi-kubernetes/provider/v4/pkg/helm"
+	"github.com/pulumi/pulumi-kubernetes/provider/v4/pkg/host"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	logger "github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
-	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/action"
 	helmchart "helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/downloader"
 	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/helmpath"
 	"helm.sh/helm/v3/pkg/postrender"
 	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage/driver"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/yaml"
 )
 
 // Default timeout for awaited install and uninstall operations
@@ -136,12 +136,11 @@ type Release struct {
 	Status *ReleaseStatus `json:"status,omitempty"`
 }
 
-type ReleaseSpec struct {
-}
+type ReleaseSpec struct{}
 
 // Specification defining the Helm chart repository to use.
 type RepositoryOpts struct {
-	// Repository where to locate the requested chart. If is a URL the chart is installed without installing the repository.
+	// Repository where to locate the requested chart. If it's a URL the chart is installed without installing the repository.
 	Repo string `json:"repo,omitempty"`
 	// The Repositories CA File
 	CAFile string `json:"caFile,omitempty"`
@@ -173,7 +172,8 @@ type ReleaseStatus struct {
 }
 
 type helmReleaseProvider struct {
-	host                     *provider.HostClient
+	host                     host.HostClient
+	canceler                 *cancellationContext
 	helmDriver               string
 	apiConfig                *api.Config
 	defaultOverrides         *clientcmd.ConfigOverrides
@@ -188,7 +188,8 @@ type helmReleaseProvider struct {
 }
 
 func newHelmReleaseProvider(
-	host *provider.HostClient,
+	host host.HostClient,
+	canceler *cancellationContext,
 	apiConfig *api.Config,
 	defaultOverrides *clientcmd.ConfigOverrides,
 	restConfig *rest.Config,
@@ -212,6 +213,7 @@ func newHelmReleaseProvider(
 
 	return &helmReleaseProvider{
 		host:                     host,
+		canceler:                 canceler,
 		apiConfig:                apiConfig,
 		defaultOverrides:         defaultOverrides,
 		restConfig:               restConfig,
@@ -273,14 +275,16 @@ func (r *helmReleaseProvider) getActionConfig(namespace string) (*action.Configu
 	return conf, nil
 }
 
+// mapReplExtractValues extracts pure values from the property map.
+var mapReplExtractValues = combineMapReplv(mapReplStripSecrets, mapReplStripComputed)
+
 func decodeRelease(pm resource.PropertyMap, label string) (*Release, error) {
 	var release Release
 	values := map[string]any{}
-	stripped := pm.MapRepl(nil, mapReplStripSecrets)
+	stripped := pm.MapRepl(nil, mapReplExtractValues)
 	logger.V(9).Infof("[%s] Decoding release: %#v", label, stripped)
 
-	if pm.HasValue("valueYamlFiles") {
-		v := stripped["valueYamlFiles"]
+	if v, ok := stripped["valueYamlFiles"]; ok {
 		switch reflect.TypeOf(v).Kind() {
 		case reflect.Slice, reflect.Array:
 			s := reflect.ValueOf(v)
@@ -292,9 +296,11 @@ func decodeRelease(pm resource.PropertyMap, label string) (*Release, error) {
 					if err != nil {
 						return nil, err
 					}
-					if err = yaml.Unmarshal(b, &values); err != nil {
+					valuesMap := map[string]any{}
+					if err = yaml.Unmarshal(b, &valuesMap); err != nil {
 						return nil, err
 					}
+					values = helm.MergeMaps(values, valuesMap)
 				default:
 					return nil, fmt.Errorf("unsupported type for 'valueYamlFiles' arg: %T", v)
 				}
@@ -317,6 +323,7 @@ func (r *helmReleaseProvider) Check(ctx context.Context, req *pulumirpc.CheckReq
 	urn := resource.URN(req.GetUrn())
 	label := fmt.Sprintf("Provider[%s].Check(%s)", r.name, urn)
 
+	var failures []*pulumirpc.CheckFailure
 	// Obtain old resource inputs. This is the old version of the resource(s) supplied by the user as
 	// an update.
 	oldResInputs := req.GetOlds()
@@ -337,38 +344,42 @@ func (r *helmReleaseProvider) Check(ctx context.Context, req *pulumirpc.CheckReq
 		KeepSecrets:  true,
 	})
 	if err != nil {
-		return nil, pkgerrors.Wrapf(err, "check failed because malformed resource inputs: %+v", err)
+		return nil, fmt.Errorf("check failed because malformed resource inputs: %w", err)
 	}
 
-	if len(olds.Mappable()) > 0 {
+	if len(olds) > 0 {
 		adoptOldNameIfUnnamed(news, olds)
 	}
 	assignNameIfAutonameable(news, urn)
 	r.setDefaults(news)
 
-	if !news.ContainsUnknowns() {
-		logger.V(9).Infof("Decoding new release.")
-		new, err := decodeRelease(news, fmt.Sprintf("%s.news", label))
-		if err != nil {
-			return nil, err
-		}
-
-		resourceNames, err := r.computeResourceNames(new, r.clientSet)
-		if err != nil && errors.Is(err, fs.ErrNotExist) {
-			// Likely because the chart is not readily available (e.g. import of chart where no repo info is stored).
-			// Declare bankruptcy in being able to determine the underlying resources and hope for the best
-			// further down the operations.
-			resourceNames = nil
-		} else if err != nil {
-			return nil, err
-		}
-
-		if len(new.ResourceNames) == 0 {
-			new.ResourceNames = resourceNames
-		}
-		logger.V(9).Infof("New: %+v", new)
-		news = resource.NewPropertyMap(new)
+	logger.V(9).Infof("Decoding new release.")
+	new, err := decodeRelease(news, fmt.Sprintf("%s.news", label))
+	if err != nil {
+		return nil, err
 	}
+
+	if !news.ContainsUnknowns() {
+		logger.V(9).Infof("Loading Helm chart.")
+		chart, err := r.helmLoad(ctx, urn, new)
+		if err != nil {
+			failures = append(failures, &pulumirpc.CheckFailure{
+				Property: "chart",
+				Reason:   fmt.Sprintf("%v; check the chart name and repository configuration.", err),
+			})
+		} else {
+			// determine the desired state of the resource, i.e the specific chart version
+			// as opposed to the program input (which is a constraint such as ">= 1.2.3").
+			// with this we may determine whether the Helm release needs to be upgraded.
+			new.Version = chart.Metadata.Version
+		}
+	}
+
+	logger.V(9).Infof("New: %+v", new)
+	news = resource.NewPropertyMap(new)
+
+	// remove deprecated inputs
+	delete(news, "resourceNames")
 
 	newInputs, err := plugin.UnmarshalProperties(newResInputs, plugin.MarshalOptions{
 		Label:        fmt.Sprintf("%s.newInputs", label),
@@ -377,9 +388,10 @@ func (r *helmReleaseProvider) Check(ctx context.Context, req *pulumirpc.CheckReq
 		KeepSecrets:  true,
 	})
 	if err != nil {
-		return nil, pkgerrors.Wrapf(err, "check failed because malformed resource inputs: %+v", err)
+		return nil, fmt.Errorf("check failed because malformed resource inputs: %w", err)
 	}
-	// ensure we don't leak secrets into state.
+	// ensure we don't leak secrets into state, and preserve the computedness of inputs.
+	annotateComputed(news, newInputs)
 	annotateSecrets(news, newInputs)
 
 	autonamedInputs, err := plugin.MarshalProperties(news, plugin.MarshalOptions{
@@ -393,7 +405,7 @@ func (r *helmReleaseProvider) Check(ctx context.Context, req *pulumirpc.CheckReq
 	}
 
 	// Return new, possibly-autonamed inputs.
-	return &pulumirpc.CheckResponse{Inputs: autonamedInputs}, nil
+	return &pulumirpc.CheckResponse{Inputs: autonamedInputs, Failures: failures}, nil
 }
 
 func (r *helmReleaseProvider) setDefaults(target resource.PropertyMap) {
@@ -419,6 +431,42 @@ func (r *helmReleaseProvider) setDefaults(target resource.PropertyMap) {
 			target["keyring"] = resource.NewStringProperty(os.ExpandEnv("$HOME/.gnupg/pubring.gpg"))
 		}
 	}
+}
+
+func (r *helmReleaseProvider) helmLoad(ctx context.Context, urn resource.URN, newRelease *Release) (*helmchart.Chart, error) {
+	conf, err := r.getActionConfig(newRelease.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	client := action.NewInstall(conf)
+	c, path, err := getChart(&client.ChartPathOptions, conf.RegistryClient, r.settings, newRelease)
+	if err != nil {
+		logger.V(9).Infof("getChart failed: %v", err)
+		logger.V(9).Infof("Settings: %#v", r.settings)
+		return nil, err
+	}
+
+	logger.V(9).Infof("Checking chart dependencies for chart: %q with path: %q", newRelease.Chart, path)
+
+	// check and update the chart's dependencies if needed
+	updated, err := checkChartDependencies(
+		c,
+		path,
+		newRelease.Keyring,
+		r.settings,
+		conf.RegistryClient,
+		newRelease.DependencyUpdate)
+	if err != nil {
+		return nil, err
+	} else if updated {
+		// load the chart again if its dependencies have been updated
+		c, err = loader.Load(path)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return c, nil
 }
 
 func (r *helmReleaseProvider) helmCreate(ctx context.Context, urn resource.URN, newRelease *Release) error {
@@ -472,7 +520,7 @@ func (r *helmReleaseProvider) helmCreate(ctx context.Context, urn resource.URN, 
 	client.WaitForJobs = !newRelease.SkipAwait && newRelease.WaitForJobs
 	client.Devel = newRelease.Devel
 	client.DependencyUpdate = newRelease.DependencyUpdate
-	client.Timeout = time.Duration(newRelease.Timeout) * time.Second
+	client.Timeout = getTimeoutOrDefault(newRelease.Timeout)
 	client.Namespace = newRelease.Namespace
 	client.ReleaseName = newRelease.Name
 	client.GenerateName = false
@@ -497,7 +545,7 @@ func (r *helmReleaseProvider) helmCreate(ctx context.Context, urn resource.URN, 
 	}
 
 	logger.V(9).Infof("install helm chart")
-	rel, err := client.Run(c, values)
+	rel, err := client.RunWithContext(r.canceler.context, c, values)
 	if err != nil && rel == nil {
 		return err
 	}
@@ -571,20 +619,20 @@ func (r *helmReleaseProvider) helmUpdate(newRelease, oldRelease *Release) error 
 		}
 	}
 
-	if newRelease.Lint {
-		if err := resourceReleaseValidate(cpo, newRelease, r.settings); err != nil {
-			return err
-		}
-	}
-
 	values, err := getValues(newRelease)
 	if err != nil {
 		return fmt.Errorf("error getting values for a diff: %w", err)
 	}
 
+	if newRelease.Lint {
+		if err := lintChart(path, values); err != nil {
+			return err
+		}
+	}
+
 	client.Devel = newRelease.Devel
 	client.Namespace = newRelease.Namespace
-	client.Timeout = time.Duration(newRelease.Timeout) * time.Second
+	client.Timeout = getTimeoutOrDefault(newRelease.Timeout)
 	client.Wait = !newRelease.SkipAwait
 	client.DisableHooks = newRelease.DisableCRDHooks
 	client.Atomic = newRelease.Atomic
@@ -610,7 +658,7 @@ func (r *helmReleaseProvider) helmUpdate(newRelease, oldRelease *Release) error 
 		client.PostRenderer = pr
 	}
 
-	rel, err := client.Run(newRelease.Name, chart, values)
+	rel, err := client.RunWithContext(r.canceler.context, newRelease.Name, chart, values)
 	if err != nil && rel == nil {
 		return err
 	}
@@ -669,16 +717,22 @@ func (r *helmReleaseProvider) Diff(ctx context.Context, req *pulumirpc.DiffReque
 		KeepSecrets:  true,
 	})
 	if err != nil {
-		return nil, pkgerrors.Wrapf(err, "diff failed because malformed resource inputs")
+		return nil, fmt.Errorf("diff failed because malformed resource inputs: %w", err)
 	}
 
 	// Extract old inputs from the `__inputs` field of the old state.
 	oldInputs, _ := parseCheckpointRelease(olds)
-	diff := oldInputs.Diff(news)
-	if diff == nil {
-		logger.V(9).Infof("No diff found for %q", req.GetUrn())
-		return &pulumirpc.DiffResponse{Changes: pulumirpc.DiffResponse_DIFF_NONE}, nil
+
+	// apply ignoreChanges
+	for _, ignore := range req.GetIgnoreChanges() {
+		if ignore == "version" {
+			news["version"] = olds["version"]
+		}
 	}
+
+	// remove deprecated inputs from old inputs, to avoid producing a delete op w.r.t. the new state.
+	delete(oldInputs, "checksum")
+	delete(oldInputs, "resourceNames")
 
 	oldRelease, err := decodeRelease(olds, fmt.Sprintf("%s.olds", label))
 	if err != nil {
@@ -692,34 +746,36 @@ func (r *helmReleaseProvider) Diff(ctx context.Context, req *pulumirpc.DiffReque
 	logger.V(9).Infof("Diff: Old release: %#v", oldRelease)
 	logger.V(9).Infof("Diff: New release: %#v", newRelease)
 
-	// Always set desired state to DEPLOYED
-	// TODO: This could be done in Check instead?
-	if newRelease.Status == nil {
-		newRelease.Status = &ReleaseStatus{}
-	}
-	newRelease.Status.Status = release.StatusDeployed.String()
-
-	oldInputsJSON, err := json.Marshal(oldInputs.Mappable())
+	// Generate a patch to apply the new inputs to the old state, including deletions.
+	// Computed values are mapped to null, and secrets are mapped to plain values.
+	// Later, we'll use this patch to generate a diff response, with special handling for the computed values.
+	oldInputsJSON, err := json.Marshal(oldInputs.MapRepl(nil, mapReplExtractValues))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("internal error: json.Marshal(oldInputsJson): %w", err)
 	}
-	newInputsJSON, err := json.Marshal(news.Mappable())
+	logger.V(9).Infof("oldInputsJSON: %s", string(oldInputsJSON))
+	newInputsJSON, err := json.Marshal(news.MapRepl(nil, mapReplExtractValues))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("internal error: json.Marshal(oldInputsJson): %w", err)
 	}
-
-	logger.V(9).Infof("oldInputsJSON: %+v", string(oldInputsJSON))
-	logger.V(9).Infof("newInputsJSON: %+v", string(newInputsJSON))
-	patch, err := jsonpatch.CreateMergePatch(oldInputsJSON, newInputsJSON)
+	logger.V(9).Infof("newInputsJSON: %s", string(newInputsJSON))
+	oldStateJSON, err := json.Marshal(olds.MapRepl(nil, mapReplExtractValues))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("internal error: json.Marshal(oldStateJson): %w", err)
 	}
+	logger.V(9).Infof("oldStateJSON: %s", string(oldStateJSON))
+	strategicPatchJSON, err := strategicpatch.CreateThreeWayMergePatch(oldInputsJSON, newInputsJSON, oldStateJSON, &noSchema{}, true)
+	if err != nil {
+		return nil, fmt.Errorf("internal error: CreateThreeWayMergePatch: %w", err)
+	}
+	logger.V(9).Infof("strategicPatchJSON: %s", string(strategicPatchJSON))
 	patchObj := map[string]any{}
-	if err = json.Unmarshal(patch, &patchObj); err != nil {
-		return nil, pkgerrors.Wrapf(
-			err, "Failed to check for changes in Helm release %s because of an error serializing "+
-				"the JSON patch describing resource changes",
-			newRelease.Name)
+	if err = json.Unmarshal(strategicPatchJSON, &patchObj); err != nil {
+		return nil, fmt.Errorf(
+			"Failed to check for changes in Helm release %s/%s because of an error serializing "+
+				"the JSON patch describing resource changes: %w",
+			oldRelease.Namespace, oldRelease.Name, err)
+
 	}
 
 	// Pack up PB, ship response back.
@@ -739,14 +795,17 @@ func (r *helmReleaseProvider) Diff(ctx context.Context, req *pulumirpc.DiffReque
 		logger.V(9).Infof("news: %+v", news.Mappable())
 		logger.V(9).Infof("oldInputs: %+v", oldInputs.Mappable())
 
-		if detailedDiff, err = convertPatchToDiff(patchObj, olds.Mappable(), news.Mappable(), oldInputs.Mappable(), ".releaseSpec.name", ".releaseSpec.namespace"); err != nil {
-			return nil, pkgerrors.Wrapf(
-				err, "Failed to check for changes in helm release %s/%s because of an error "+
-					"converting JSON patch describing resource changes to a diff",
-				newRelease.Namespace, newRelease.Name)
+		strip := func(pm resource.PropertyMap) map[string]interface{} {
+			// strip the secretness but retain computedness (as is understood by convertPatchToDiff)
+			return pm.MapRepl(nil, mapReplStripSecrets)
 		}
-		for _, v := range detailedDiff {
-			v.InputDiff = true
+		forceNewFields := []string{".name", ".namespace"}
+		if detailedDiff, err = convertPatchToDiff(patchObj, strip(olds), strip(news), strip(oldInputs), forceNewFields...); err != nil {
+			return nil, fmt.Errorf(
+				"Failed to check for changes in helm release %s/%s because of an error "+
+					"converting JSON patch describing resource changes to a diff: %w",
+				oldRelease.Namespace, oldRelease.Name, err)
+
 		}
 
 		for k, v := range detailedDiff {
@@ -764,30 +823,11 @@ func (r *helmReleaseProvider) Diff(ctx context.Context, req *pulumirpc.DiffReque
 		DeleteBeforeReplace: false, // TODO: revisit this.
 		Diffs:               changes,
 		DetailedDiff:        detailedDiff,
-		HasDetailedDiff:     true,
+		HasDetailedDiff:     len(detailedDiff) > 0,
 	}, nil
 }
 
-func resourceReleaseValidate(cpo *action.ChartPathOptions, release *Release, settings *cli.EnvSettings) error {
-	name, err := chartPathOptionsFromRelease(cpo, release)
-	if err != nil {
-		return fmt.Errorf("malformed values: \n\t%s", err)
-	}
-
-	values, err := getValues(release)
-	if err != nil {
-		return err
-	}
-
-	return lintChart(settings, name, cpo, values)
-}
-
-func lintChart(settings *cli.EnvSettings, name string, cpo *action.ChartPathOptions, values map[string]any) (err error) {
-	path, err := cpo.LocateChart(name, settings)
-	if err != nil {
-		return err
-	}
-
+func lintChart(path string, values map[string]any) (err error) {
 	l := action.NewLint()
 	result := l.Run([]string{path}, values)
 
@@ -823,7 +863,7 @@ func (r *helmReleaseProvider) Create(ctx context.Context, req *pulumirpc.CreateR
 		KeepSecrets:  true,
 	})
 	if err != nil {
-		return nil, pkgerrors.Wrapf(err, "create failed because malformed resource inputs")
+		return nil, fmt.Errorf("create failed because malformed resource inputs: %w", err)
 	}
 
 	newRelease, err := decodeRelease(news, fmt.Sprintf("%s.news", label))
@@ -849,7 +889,7 @@ func (r *helmReleaseProvider) Create(ctx context.Context, req *pulumirpc.CreateR
 		}
 	}
 
-	obj := checkpointRelease(news, newRelease, fmt.Sprintf("%s.news", label))
+	obj := checkpointRelease(news, newRelease, fmt.Sprintf("%s.news", label), req.GetPreview())
 	inputsAndComputed, err := plugin.MarshalProperties(
 		obj, plugin.MarshalOptions{
 			Label:        fmt.Sprintf("%s.inputsAndComputed", label),
@@ -864,9 +904,10 @@ func (r *helmReleaseProvider) Create(ctx context.Context, req *pulumirpc.CreateR
 	if creationError != nil {
 		return nil, partialError(
 			id,
-			pkgerrors.Wrapf(
-				creationError, "Helm release %q was created, but failed to initialize completely. "+
-					"Use Helm CLI to investigate.", id),
+			fmt.Errorf(
+				"Helm release %q was created, but failed to initialize completely. "+
+					"Use Helm CLI to investigate: %w", id, creationError),
+
 			inputsAndComputed,
 			nil)
 	}
@@ -898,14 +939,13 @@ func (r *helmReleaseProvider) Read(ctx context.Context, req *pulumirpc.ReadReque
 	logger.V(9).Infof("%s decoded release: %#v", label, existingRelease)
 
 	var namespace, name string
-	if len(oldState.Mappable()) == 0 {
+	if len(oldState) == 0 {
 		namespace, name = parseFqName(req.GetId())
+		logger.V(9).Infof("%s Starting import for %s/%s", label, namespace, name)
 	} else {
 		name = existingRelease.Name
 		namespace = existingRelease.Namespace
 	}
-
-	logger.V(9).Infof("%s Starting import for %s/%s", label, namespace, name)
 
 	actionConfig, err := r.getActionConfig(namespace)
 	if err != nil {
@@ -929,15 +969,21 @@ func (r *helmReleaseProvider) Read(ctx context.Context, req *pulumirpc.ReadReque
 
 	oldInputs, _ := parseCheckpointRelease(oldState)
 	if oldInputs == nil {
-		// No old inputs suggests this is an import. Hydrate the imports from the current live object
-		logger.V(9).Infof("existingRelease: %#v", existingRelease)
+		// No old inputs suggests this is an import. Hydrate the state from the current live object.
+		// A subsequent Check operation will apply the computed inputs.
+		err = r.importRelease(ctx, urn, existingRelease, liveObj)
+		if err != nil {
+			return nil, err
+		}
+		logger.V(9).Infof("%s Imported release: %#v", label, existingRelease)
+
 		oldInputs = r.serializeImportInputs(existingRelease)
 		r.setDefaults(oldInputs)
 	}
 
 	// Return a new "checkpoint object".
 	state, err := plugin.MarshalProperties(
-		checkpointRelease(oldInputs, existingRelease, fmt.Sprintf("%s.olds", label)), plugin.MarshalOptions{
+		checkpointRelease(oldInputs, existingRelease, fmt.Sprintf("%s.olds", label), false), plugin.MarshalOptions{
 			Label:        fmt.Sprintf("%s.state", label),
 			KeepUnknowns: true,
 			SkipNulls:    true,
@@ -947,10 +993,8 @@ func (r *helmReleaseProvider) Read(ctx context.Context, req *pulumirpc.ReadReque
 		return nil, err
 	}
 
-	liveInputsPM := r.serializeImportInputs(existingRelease)
-
-	inputs, err := plugin.MarshalProperties(liveInputsPM, plugin.MarshalOptions{
-		Label: label + ".inputs", KeepUnknowns: true, SkipNulls: true, KeepSecrets: r.enableSecrets,
+	inputs, err := plugin.MarshalProperties(oldInputs, plugin.MarshalOptions{
+		Label: label + ".inputs", KeepUnknowns: true, SkipNulls: true, KeepSecrets: r.enableSecrets, //nolint:goconst
 	})
 	if err != nil {
 		return nil, err
@@ -966,6 +1010,7 @@ func (r *helmReleaseProvider) Read(ctx context.Context, req *pulumirpc.ReadReque
 
 func (r *helmReleaseProvider) serializeImportInputs(release *Release) resource.PropertyMap {
 	inputs := resource.NewPropertyMap(release)
+	delete(inputs, "resourceNames")
 	delete(inputs, "status")
 	return inputs
 }
@@ -989,7 +1034,7 @@ func (r *helmReleaseProvider) Update(ctx context.Context, req *pulumirpc.UpdateR
 		KeepSecrets:  true,
 	})
 	if err != nil {
-		return nil, pkgerrors.Wrapf(err, "update failed because malformed resource inputs")
+		return nil, fmt.Errorf("update failed because malformed resource inputs: %w", err)
 	}
 
 	logger.V(9).Infof("%s executing", label)
@@ -1019,7 +1064,7 @@ func (r *helmReleaseProvider) Update(ctx context.Context, req *pulumirpc.UpdateR
 		}
 	}
 
-	checkpointed := checkpointRelease(newResInputs, newRelease, fmt.Sprintf("%s.news", label))
+	checkpointed := checkpointRelease(newResInputs, newRelease, fmt.Sprintf("%s.news", label), req.GetPreview())
 	inputsAndComputed, err := plugin.MarshalProperties(
 		checkpointed, plugin.MarshalOptions{
 			Label:        fmt.Sprintf("%s.inputsAndComputed", label),
@@ -1034,16 +1079,17 @@ func (r *helmReleaseProvider) Update(ctx context.Context, req *pulumirpc.UpdateR
 	if updateError != nil {
 		return nil, partialError(
 			fqName(newRelease.Namespace, newRelease.Name),
-			pkgerrors.Wrapf(
-				updateError, "Helm release %q failed to initialize completely. "+
-					"Use Helm CLI to investigate.", fqName(newRelease.Namespace, newRelease.Name)),
+			fmt.Errorf(
+				"Helm release %q failed to initialize completely. "+
+					"Use Helm CLI to investigate: %w", fqName(newRelease.Namespace, newRelease.Name), updateError),
+
 			inputsAndComputed,
 			nil)
 	}
 	return &pulumirpc.UpdateResponse{Properties: inputsAndComputed}, nil
 }
 
-func (r *helmReleaseProvider) Delete(ctx context.Context, req *pulumirpc.DeleteRequest) (*empty.Empty, error) {
+func (r *helmReleaseProvider) Delete(ctx context.Context, req *pulumirpc.DeleteRequest) (*pbempty.Empty, error) {
 	urn := resource.URN(req.GetUrn())
 	label := fmt.Sprintf("Provider[%s].Delete(%s)", r.name, urn)
 
@@ -1071,12 +1117,9 @@ func (r *helmReleaseProvider) Delete(ctx context.Context, req *pulumirpc.DeleteR
 	uninstall := action.NewUninstall(actionConfig)
 	if release.Atomic || !release.SkipAwait { // If the release was atomic or skipAwait was not set, block on deletion
 		uninstall.Wait = true
-		timeout := release.Timeout
-		if timeout == 0 {
-			timeout = defaultTimeoutSeconds
-		}
-		uninstall.Timeout = time.Duration(timeout) * time.Second
+		uninstall.Timeout = getTimeoutOrDefault(release.Timeout)
 	}
+	// TODO: once https://github.com/helm/helm/pull/12109 is merged, use uninstall.RunWithContext
 	res, err := uninstall.Run(name)
 	if err != nil {
 		return nil, err
@@ -1088,69 +1131,23 @@ func (r *helmReleaseProvider) Delete(ctx context.Context, req *pulumirpc.DeleteR
 	return &pbempty.Empty{}, nil
 }
 
-func (r *helmReleaseProvider) computeResourceNames(rel *Release, clientSet *clients.DynamicClientSet) (map[string][]string, error) {
-	logger.V(9).Infof("Looking up resource names for release: %q: %#v", rel.Name, rel)
-	helmChartOpts := r.chartOptsFromRelease(rel)
-
-	logger.V(9).Infof("About to template: %+v", helmChartOpts)
-	templ, err := helmTemplate(helmChartOpts, clientSet, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	_, resourceNames, err := convertYAMLManifestToJSON(templ)
-	if err != nil {
-		return nil, err
-	}
-
-	return resourceNames, nil
-}
-
-func (r *helmReleaseProvider) chartOptsFromRelease(rel *Release) HelmChartOpts {
-	helmHome := os.Getenv("HELM_HOME")
-
-	helmChartOpts := HelmChartOpts{
-		APIVersions:              nil,
-		SkipCRDRendering:         rel.SkipCrds,
-		Namespace:                rel.Namespace,
-		ReleaseName:              rel.Name,
-		Values:                   rel.Values,
-		Version:                  rel.Version,
-		HelmChartDebug:           r.settings.Debug,
-		IncludeTestHookResources: true,
-		HelmRegistryConfig:       r.settings.RegistryConfig,
-	}
-	if rel.RepositoryOpts != nil {
-		helmChartOpts.Chart = rel.Chart
-		helmChartOpts.HelmFetchOpts = HelmFetchOpts{
-			CAFile:   rel.RepositoryOpts.CAFile,
-			CertFile: rel.RepositoryOpts.CertFile,
-			Devel:    rel.Devel,
-			Home:     helmHome,
-			KeyFile:  rel.RepositoryOpts.KeyFile,
-			Keyring:  rel.Keyring,
-			Password: rel.RepositoryOpts.Password,
-			Repo:     rel.RepositoryOpts.Repo,
-			Username: rel.RepositoryOpts.Username,
-			Version:  rel.Version,
-		}
-	} else if registry.IsOCI(rel.Chart) {
-		helmChartOpts.Chart = rel.Chart
-	} else {
-		helmChartOpts.Path = rel.Chart
-	}
-	return helmChartOpts
-}
-
-func checkpointRelease(inputs resource.PropertyMap, outputs *Release, label string) resource.PropertyMap {
+func checkpointRelease(inputs resource.PropertyMap, outputs *Release, label string, isPreview bool) resource.PropertyMap {
 	logger.V(9).Infof("[%s] Checkpointing outputs: %#v", label, outputs)
 	logger.V(9).Infof("[%s] Checkpointing inputs: %#v", label, inputs)
 	object := resource.NewPropertyMap(outputs)
 	object["__inputs"] = resource.MakeSecret(resource.NewObjectProperty(inputs))
 
 	// Make sure parts of the inputs which are marked as secrets in the inputs are retained as
-	// secrets in the outputs.
+	// secrets in the outputs. Likewise for computed values.
+	annotateComputed(object, inputs)
 	annotateSecrets(object, inputs)
+
+	// If this is a preview, emit computed placeholders for the pure outputs.
+	if isPreview {
+		object["resourceNames"] = resource.MakeComputed(resource.NewStringProperty(""))
+		object["status"] = resource.MakeComputed(resource.NewStringProperty(""))
+	}
+
 	return object
 }
 
@@ -1257,6 +1254,34 @@ func getRelease(cfg *action.Configuration, name string) (*release.Release, error
 	return res, nil
 }
 
+func (r *helmReleaseProvider) importRelease(ctx context.Context, urn resource.URN, release *Release, hr *release.Release) error {
+
+	// note: setReleaseAttributes pre-populates some of the inputs
+
+	// Attempt to resolve the chart's origin in either a local or remote repository.
+	// Note that the local chart is not verified.
+	if name, _, found := searchProgramDirectory(hr.Chart.Metadata.Name, hr.Chart.Metadata.Version); found {
+		release.Chart = name
+	} else if repo, chart, found := searchHelmRepositories(r.settings, hr.Chart.Metadata.Name, hr.Chart.Metadata.Version); found {
+		// use a local repository reference, rather than reconstructing all the repository opts
+		release.Chart = fmt.Sprintf("%s/%s", repo.Name, chart.Name)
+	} else {
+		// fallback to using a local chart reference
+		release.Chart = hr.Chart.Metadata.Name
+	}
+
+	chart, err := r.helmLoad(ctx, urn, release)
+	if err != nil {
+		// Likely because the chart is not readily available (e.g. import of chart where no repo info is stored).
+		// Eat the error to allow import to succeed, assuming that Check will report the failure later.
+		contract.IgnoreError(err)
+	} else {
+		release.Version = chart.Metadata.Version
+	}
+
+	return nil
+}
+
 func isChartInstallable(ch *helmchart.Chart) error {
 	switch ch.Metadata.Type {
 	case "", "application":
@@ -1300,12 +1325,12 @@ func logValues(values map[string]any) error {
 // Merges a and b map, preferring values from b map
 func mergeMaps(a, b map[string]any, allowNullValues bool) (map[string]any, error) {
 	if allowNullValues {
-		a = mapToInterface(a).(map[string]any)
-		b = mapToInterface(b).(map[string]any)
-	} else {
-		a = excludeNulls(a).(map[string]any)
-		b = excludeNulls(b).(map[string]any)
+		// Use upstream's behavior.
+		return helm.MergeMaps(a, b), nil
 	}
+
+	a = excludeNulls(a).(map[string]any)
+	b = excludeNulls(b).(map[string]any)
 	if err := mergo.Merge(&a, b, mergo.WithOverride, mergo.WithTypeCheck); err != nil {
 		return nil, err
 	}
@@ -1343,29 +1368,59 @@ func excludeNulls(in any) any {
 	return in
 }
 
-func mapToInterface(in any) any {
-	switch reflect.TypeOf(in).Kind() {
-	case reflect.Map:
-		out := map[string]any{}
-		m := in.(map[string]any)
-		for k, v := range m {
-			val := reflect.ValueOf(v)
-			if !val.IsValid() {
-				out[k] = v
-				continue
-			}
-			out[k] = mapToInterface(v)
-		}
-		return out
-	case reflect.Slice, reflect.Array:
-		var out []any
-		s := in.([]any)
-		for _, i := range s {
-			out = append(out, mapToInterface(i))
-		}
-		return out
+// searchProgramDirectory implements a best-effort search for a chart in the program directory.
+// It searches for a chart archive and for an unpacked chart directory, with and without a version suffix.
+// The search order is: "<name>-<version>/", "<name>-<version>.tgz", "<name>/", "<name>.tgz".
+func searchProgramDirectory(name, version string) (string, *helmchart.Metadata, bool) {
+	var file, dir string
+	dir = fmt.Sprintf("%s-%s", name, version)
+	if c, err := loader.LoadDir(dir); err == nil {
+		return dir, c.Metadata, true
 	}
-	return in
+	file = fmt.Sprintf("%s-%s.tgz", name, version)
+	if c, err := loader.LoadFile(file); err == nil {
+		return file, c.Metadata, true
+	}
+	dir = name
+	if c, err := loader.LoadDir(dir); err == nil {
+		return dir, c.Metadata, true
+	}
+	file = fmt.Sprintf("%s.tgz", name)
+	if c, err := loader.LoadFile(file); err == nil {
+		return file, c.Metadata, true
+	}
+	return "", nil, false
+}
+
+// searchHelmRepositories implements a best-effort search for a chart in the locally-configured repositories.
+func searchHelmRepositories(settings *cli.EnvSettings, name, version string) (*repo.Entry, *repo.ChartVersion, bool) {
+	repoFile := settings.RepositoryConfig
+	repoCacheDir := settings.RepositoryCache
+
+	// Load the repositories.yaml
+	rf, err := repo.LoadFile(repoFile)
+	if errors.Is(err, fs.ErrNotExist) || len(rf.Repositories) == 0 {
+		logger.V(9).Infof("no repositories configured")
+		return nil, nil, false
+	}
+
+	// Scan the repositories for a chart
+	for _, re := range rf.Repositories {
+		n := re.Name
+		f := filepath.Join(repoCacheDir, helmpath.CacheIndexFile(n))
+		ind, err := repo.LoadIndexFile(f)
+		if err != nil {
+			logger.V(9).Infof("Repo %q is corrupt or missing. Try 'helm repo update'.", n)
+			continue
+		}
+		chartVersion, err := ind.Get(name, version)
+		if err != nil {
+			logger.V(9).Infof("No such chart: %v", err)
+			continue
+		}
+		return re, chartVersion, true
+	}
+	return nil, nil, false
 }
 
 func getChart(cpo *action.ChartPathOptions, registryClient *registry.Client, settings *cli.EnvSettings,
@@ -1398,15 +1453,12 @@ func getChart(cpo *action.ChartPathOptions, registryClient *registry.Client, set
 func localChart(name string, verify bool, keyring string) (string, bool, error) {
 	fi, err := os.Stat(name)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", false, nil
-		}
-
-		return "", false, err
+		// Helm eats all errors at this point.
+		return "", false, nil
 	}
 
 	// If a folder is of the same name as a chart, use the folder if it contains a Chart.yaml.
-	if err == nil && fi.IsDir() {
+	if fi.IsDir() {
 		if _, err := os.Stat(filepath.Join(name, "Chart.yaml")); err != nil {
 			// This is not a chart directory, so do not error as Helm could still
 			// resolve this as a locally added chart repository, eg. `helm repo add`.
@@ -1431,11 +1483,9 @@ func localChart(name string, verify bool, keyring string) (string, bool, error) 
 	return absPath, true, nil
 }
 
-// locateChart is a copy of cpo.LocateChart with a fix to actually honor the registry client
-// configured with a registry config. As currently written, LocateChart will only ever honor
-// the registry config in $HELM_HOME/registry/config.json or the platform specific docker
-// default credential store.
-// TODO open issue on Helm for this.
+// locateChart is a copy of cpo.LocateChart with specialized behavior around the resolution of
+// local charts. Helm prefers a local chart over a remote chart with the same name, even if the local chart
+// directory is not well-formed. Pulumi adds additional checks of the local chart directory.
 func locateChart(cpo *action.ChartPathOptions, registryClient *registry.Client, name string,
 	settings *cli.EnvSettings) (string, error) {
 	name = strings.TrimSpace(name)
@@ -1450,7 +1500,7 @@ func locateChart(cpo *action.ChartPathOptions, registryClient *registry.Client, 
 
 		// If not found, do more validations. This is from the original LocateChart.
 		if filepath.IsAbs(name) || strings.HasPrefix(name, ".") {
-			return name, pkgerrors.Errorf("path %q not found", name)
+			return name, fmt.Errorf("path %q not found", name)
 		}
 	}
 
@@ -1529,7 +1579,7 @@ func locateChart(cpo *action.ChartPathOptions, registryClient *registry.Client, 
 		atVersion = fmt.Sprintf(" at version %q", version)
 	}
 
-	return filename, pkgerrors.Errorf("failed to download %q%s", name, atVersion)
+	return filename, fmt.Errorf("failed to download %q%s", name, atVersion)
 }
 
 func checkChartDependencies(c *helmchart.Chart, path, keyring string, settings *cli.EnvSettings,
@@ -1608,7 +1658,7 @@ func resolveChartName(repository, name string) (string, string, error) {
 		return repository, name, nil
 	}
 
-	if strings.Index(name, "/") == -1 && repository != "" {
+	if !strings.Contains(name, "/") && repository != "" {
 		name = fmt.Sprintf("%s/%s", repository, name)
 	}
 
@@ -1617,4 +1667,29 @@ func resolveChartName(repository, name string) (string, string, error) {
 
 func isHelmRelease(urn resource.URN) bool {
 	return urn.Type() == "kubernetes:helm.sh/v3:Release"
+}
+
+func getTimeoutOrDefault(timeout int) time.Duration {
+	if timeout == 0 {
+		timeout = defaultTimeoutSeconds
+	}
+	return time.Duration(timeout) * time.Second
+}
+
+// noSchema implements a trivial lookup function for patch metadata (i.e. patch strategy and merge key).
+// CreateThreeWayMergePatch supports various strategies for merging maps and slices, but we use the default strategy.
+type noSchema struct{}
+
+var _ strategicpatch.LookupPatchMeta = &noSchema{}
+
+func (*noSchema) LookupPatchMetadataForSlice(key string) (strategicpatch.LookupPatchMeta, strategicpatch.PatchMeta, error) {
+	return &noSchema{}, strategicpatch.PatchMeta{}, nil
+}
+
+func (*noSchema) LookupPatchMetadataForStruct(key string) (strategicpatch.LookupPatchMeta, strategicpatch.PatchMeta, error) {
+	return &noSchema{}, strategicpatch.PatchMeta{}, nil
+}
+
+func (*noSchema) Name() string {
+	return ""
 }
